@@ -9,6 +9,25 @@ import os
 import sys
 
 from pyemvue import PyEmVue
+from pyemvue.enums import Scale, Unit
+
+
+def live_power_kw(vue: PyEmVue, charger_gid: int):
+    usage = vue.get_device_list_usage(
+        [charger_gid], None, scale=Scale.SECOND.value, unit=Unit.KWH.value
+    )
+    device_usage = usage.get(charger_gid)
+    if not device_usage:
+        return None
+    total_kwh = 0.0
+    has_data = False
+    for channel in device_usage.channels.values():
+        if channel.usage is not None:
+            total_kwh += channel.usage
+            has_data = True
+    if not has_data:
+        return None
+    return round(total_kwh * 3600, 3)
 
 
 def main() -> int:
@@ -19,7 +38,7 @@ def main() -> int:
         return 1
 
     vue = PyEmVue()
-    logged_in = vue.login(email=email, password=password)
+    logged_in = vue.login(username=email, password=password)
     if not logged_in:
         print("Login failed, check credentials.")
         return 1
@@ -42,9 +61,16 @@ def main() -> int:
     (_, chargers) = vue.get_devices_status(devices)
     print(f"Found {len(chargers)} charger(s).")
     for c in chargers:
+        live_kw = None
+        try:
+            live_kw = live_power_kw(vue, c.device_gid)
+        except Exception as err:  # noqa: BLE001
+            print(f"  unable to fetch live power for charger {c.device_gid}: {err}")
+        kw = round((c.charging_rate or 0) * 240 / 1000, 3)
         print(
             f"- Charger {c.device_gid}: status={c.status or 'unknown'} "
-            f"on={c.charger_on} rate={c.charging_rate}/{c.max_charging_rate}"
+            f"on={c.charger_on} rate={c.charging_rate}A (est {kw} kW) "
+            f"live_power={live_kw if live_kw is not None else 'n/a'} kW"
         )
 
     print("Check complete.")

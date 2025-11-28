@@ -5,6 +5,7 @@ from datetime import timedelta
 
 from pyemvue import PyEmVue
 from pyemvue.device import ChargerDevice, Vehicle, VueDevice
+from pyemvue.enums import Scale, Unit
 from homeassistant.const import PERCENTAGE, UnitOfPower
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.sensor import (
@@ -19,6 +20,8 @@ from .const import DOMAIN, VUE_DATA, UPDATE_INTERVAL_SECONDS
 
 # Update interval - too frequent will hit Emporia limits.
 SCAN_INTERVAL = timedelta(seconds=UPDATE_INTERVAL_SECONDS)
+# Default voltage to convert charger amps to kW when Emporia only provides amps.
+ASSUMED_VOLTAGE = 240
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -153,6 +156,7 @@ class ChargerStatusSensor(SensorEntity):
         refreshed = _refresh_charger_state(self.vue, self.charger.device_gid)
         if refreshed:
             self.charger = refreshed
+        live_kw = _get_live_power_kw(self.vue, self.charger.device_gid)
 
         self._state = self.charger.status or (
             "on" if self.charger.charger_on else "off"
@@ -168,6 +172,7 @@ class ChargerStatusSensor(SensorEntity):
             "load_gid": self.charger.load_gid,
             "pro_control_code": self.charger.pro_control_code,
             "debug_code": self.charger.debug_code,
+            "live_power_kw": live_kw,
         }
         _LOGGER.debug(
             "Fetched charger status for %s - state: %s rate: %s/%s",
@@ -240,15 +245,20 @@ class ChargerPowerSensor(SensorEntity):
         if refreshed:
             self.charger = refreshed
 
-        self._native_value = self.charger.charging_rate
+        live_kw = _get_live_power_kw(self.vue, self.charger.device_gid)
+        self._native_value = live_kw if live_kw is not None else self._calculate_kw(self.charger.charging_rate)
         self.extra_attributes = {
             "max_charging_rate": self.charger.max_charging_rate,
             "charger_on": self.charger.charger_on,
             "status": self.charger.status,
+            "raw_charging_rate_amps": self.charger.charging_rate,
+            "assumed_voltage": ASSUMED_VOLTAGE,
+            "live_power_kw": live_kw,
         }
         _LOGGER.debug(
-            "Fetched charger power for %s - rate: %s/%s",
+            "Fetched charger power for %s - rate: %s kW (raw %s/%s amps)",
             self.charger.device_gid,
+            self._native_value,
             self.charger.charging_rate,
             self.charger.max_charging_rate,
         )
@@ -278,6 +288,12 @@ class ChargerPowerSensor(SensorEntity):
             "name": self._charger_name,
         }
 
+    def _calculate_kw(self, charging_rate: float | None) -> float | None:
+        if charging_rate is None:
+            return None
+        # Emporia charger reports amps; convert to kW assuming split-phase ~240V.
+        return round((charging_rate * ASSUMED_VOLTAGE) / 1000, 3)
+
 
 def _refresh_charger_state(vue: PyEmVue, charger_gid: int) -> ChargerDevice | None:
     """Refresh charger status with a short-lived cache to avoid double-polls per cycle."""
@@ -297,3 +313,31 @@ def _refresh_charger_state(vue: PyEmVue, charger_gid: int) -> ChargerDevice | No
         return None
 
     return _last_charger_status.get(charger_gid)
+
+
+def _get_live_power_kw(vue: PyEmVue, charger_gid: int) -> float | None:
+    """Return live charger power in kW using the usage endpoint (1-second scale)."""
+    try:
+        usage = vue.get_device_list_usage(
+            [charger_gid], None, scale=Scale.SECOND.value, unit=Unit.KWH.value
+        )
+    except Exception as err:
+        _LOGGER.debug("Unable to fetch live power for charger %s: %s", charger_gid, err)
+        return None
+
+    device_usage = usage.get(charger_gid)
+    if not device_usage:
+        return None
+
+    # Sum all channel usages (kWh consumed over the 1-second interval).
+    total_kwh = 0.0
+    has_data = False
+    for channel in device_usage.channels.values():
+        if channel.usage is not None:
+            total_kwh += channel.usage
+            has_data = True
+    if not has_data:
+        return None
+
+    # Convert 1-second kWh consumption to kW (kWh * 3600).
+    return round(total_kwh * 3600, 3)
