@@ -1,10 +1,11 @@
 import asyncio
 import logging
+import time
 from datetime import timedelta
 
 from pyemvue import PyEmVue
 from pyemvue.device import ChargerDevice, Vehicle, VueDevice
-from homeassistant.const import PERCENTAGE
+from homeassistant.const import PERCENTAGE, UnitOfPower
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -22,6 +23,8 @@ SCAN_INTERVAL = timedelta(seconds=UPDATE_INTERVAL_SECONDS)
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 charger_devices: dict[int, VueDevice] = {}
+_last_charger_status: dict[int, ChargerDevice] = {}
+_last_charger_poll: float | None = None
 
 
 async def async_setup_entry(
@@ -59,6 +62,7 @@ async def async_setup_entry(
         )
         for charger in chargers:
             sensors.append(ChargerStatusSensor(vue, charger))
+            sensors.append(ChargerPowerSensor(vue, charger))
         if chargers:
             _LOGGER.info("Monitoring %s chargers", len(chargers))
         else:
@@ -146,18 +150,9 @@ class ChargerStatusSensor(SensorEntity):
 
     def update(self) -> None:
         # Fetch latest charger state from Emporia.
-        devices = list(charger_devices.values()) if charger_devices else None
-        try:
-            (_, chargers) = self.vue.get_devices_status(devices)
-            updated = next(
-                (c for c in chargers if c.device_gid == self.charger.device_gid), None
-            )
-            if updated:
-                self.charger = updated
-        except Exception as err:
-            _LOGGER.warning(
-                "Unable to refresh charger %s status: %s", self.charger.device_gid, err
-            )
+        refreshed = _refresh_charger_state(self.vue, self.charger.device_gid)
+        if refreshed:
+            self.charger = refreshed
 
         self._state = self.charger.status or (
             "on" if self.charger.charger_on else "off"
@@ -212,3 +207,93 @@ class ChargerStatusSensor(SensorEntity):
         """Return a friendly charging rate value."""
         # charging_rate unit is reported directly from Emporia; keep raw.
         return self.charger.charging_rate
+
+
+class ChargerPowerSensor(SensorEntity):
+    """Power sensor for Emporia EV charger (current charging rate)."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
+    _attr_icon = "mdi:flash"
+
+    def __init__(self, vue_client: PyEmVue, charger: ChargerDevice) -> None:
+        self.vue = vue_client
+        self.charger = charger
+        self._charger_name = self._get_charger_name(charger.device_gid)
+        self._native_value: float | None = None
+        self.extra_attributes: dict[str, object] = {}
+
+    def _get_charger_name(self, charger_gid: int) -> str:
+        device = charger_devices.get(charger_gid)
+        if device:
+            return (
+                device.display_name
+                or device.device_name
+                or device.manufacturer_id
+                or f"Charger {charger_gid}"
+            )
+        return f"Charger {charger_gid}"
+
+    def update(self) -> None:
+        refreshed = _refresh_charger_state(self.vue, self.charger.device_gid)
+        if refreshed:
+            self.charger = refreshed
+
+        self._native_value = self.charger.charging_rate
+        self.extra_attributes = {
+            "max_charging_rate": self.charger.max_charging_rate,
+            "charger_on": self.charger.charger_on,
+            "status": self.charger.status,
+        }
+        _LOGGER.debug(
+            "Fetched charger power for %s - rate: %s/%s",
+            self.charger.device_gid,
+            self.charger.charging_rate,
+            self.charger.max_charging_rate,
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        return self._native_value
+
+    @property
+    def name(self) -> str:
+        return f"{self._charger_name} Charging Power"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        return self.extra_attributes
+
+    @property
+    def unique_id(self):
+        """Unique ID for the charger power sensor."""
+        return f"sensor.vehiclevue.charger.power.{self.charger.device_gid}"
+
+    @property
+    def device_info(self):
+        """Return device information about this entity."""
+        return {
+            "identifiers": {(DOMAIN, f"charger-{self.charger.device_gid}")},
+            "name": self._charger_name,
+        }
+
+
+def _refresh_charger_state(vue: PyEmVue, charger_gid: int) -> ChargerDevice | None:
+    """Refresh charger status with a short-lived cache to avoid double-polls per cycle."""
+    global _last_charger_poll, _last_charger_status
+    now = time.monotonic()
+    if _last_charger_poll and now - _last_charger_poll < 2:
+        if charger_gid in _last_charger_status:
+            return _last_charger_status[charger_gid]
+
+    devices = list(charger_devices.values()) if charger_devices else None
+    try:
+        (_, chargers) = vue.get_devices_status(devices)
+        _last_charger_poll = now
+        _last_charger_status = {c.device_gid: c for c in chargers}
+    except Exception as err:
+        _LOGGER.warning("Unable to refresh charger status: %s", err)
+        return None
+
+    return _last_charger_status.get(charger_gid)
