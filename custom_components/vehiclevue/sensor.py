@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import time
+from dataclasses import dataclass
 from datetime import timedelta
 
 from pyemvue import PyEmVue
@@ -15,6 +15,11 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
 
 from .const import DOMAIN, VUE_DATA, UPDATE_INTERVAL_SECONDS
 
@@ -26,8 +31,78 @@ ASSUMED_VOLTAGE = 240
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 charger_devices: dict[int, VueDevice] = {}
-_last_charger_status: dict[int, ChargerDevice] = {}
-_last_charger_poll: float | None = None
+
+
+@dataclass
+class VehicleVueCoordinatorData:
+    """Container for Emporia vehicle/charger data."""
+
+    vehicle_status: dict[int, object]
+    chargers: dict[int, ChargerDevice]
+    charger_power_kw: dict[int, float | None]
+
+
+class VehicleVueDataCoordinator(DataUpdateCoordinator[VehicleVueCoordinatorData]):
+    """Coordinator to poll Emporia vehicle + charger state."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        vue_client: PyEmVue,
+        vehicles: list[Vehicle],
+        chargers: list[VueDevice],
+    ) -> None:
+        self.vue = vue_client
+        self._vehicles = vehicles
+        self._chargers = chargers
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="VehicleVue data",
+            update_interval=SCAN_INTERVAL,
+        )
+
+    def _fetch_vehicle_status(self) -> dict[int, object]:
+        statuses: dict[int, object] = {}
+        for vehicle in self._vehicles:
+            statuses[vehicle.vehicle_gid] = self.vue.get_vehicle_status(
+                vehicle.vehicle_gid
+            )
+        return statuses
+
+    def _fetch_charger_status(self) -> dict[int, ChargerDevice]:
+        if not self._chargers:
+            return {}
+        (_, chargers) = self.vue.get_devices_status(self._chargers)
+        return {charger.device_gid: charger for charger in chargers}
+
+    async def _async_update_data(self) -> VehicleVueCoordinatorData:
+        loop = asyncio.get_event_loop()
+        try:
+            vehicle_status = await loop.run_in_executor(
+                None, self._fetch_vehicle_status
+            )
+            chargers = await loop.run_in_executor(None, self._fetch_charger_status)
+        except Exception as err:
+            raise UpdateFailed(f"Error talking to Emporia: {err}") from err
+
+        charger_power: dict[int, float | None] = {}
+        for gid in chargers:
+            try:
+                charger_power[gid] = await loop.run_in_executor(
+                    None, _get_live_power_kw, self.vue, gid
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Unable to fetch live power for charger %s: %s", gid, err
+                )
+                charger_power[gid] = None
+
+        return VehicleVueCoordinatorData(
+            vehicle_status=vehicle_status,
+            chargers=chargers,
+            charger_power_kw=charger_power,
+        )
 
 
 async def async_setup_entry(
@@ -51,57 +126,60 @@ async def async_setup_entry(
         if dev.ev_charger:
             charger_devices[dev.device_gid] = dev
 
-    # Set up sensors for each vehicle.
-    vehicle_sensors = []
-    for vehicle in vehicles:
-        vehicle_sensors.append(VehicleSensor(vue, vehicle))
+    coordinator = VehicleVueDataCoordinator(
+        hass, vue, vehicles, list(charger_devices.values())
+    )
+    await coordinator.async_config_entry_first_refresh()
+
+    vehicle_sensors = [VehicleSensor(coordinator, vehicle) for vehicle in vehicles]
     _LOGGER.info("Monitoring %s vehicles", len(vehicle_sensors))
 
-    sensors = vehicle_sensors
-    # Add a status sensor for each Emporia EV charger.
-    try:
-        (_, chargers) = await loop.run_in_executor(
-            None, lambda: vue.get_devices_status(devices)
+    chargers = (
+        list(coordinator.data.chargers.values()) if coordinator.data else []
+    )
+    charger_sensors: list[SensorEntity] = []
+    for charger in chargers:
+        charger_sensors.append(
+            ChargerStatusSensor(coordinator, charger.device_gid)
         )
-        for charger in chargers:
-            sensors.append(ChargerStatusSensor(vue, charger))
-            sensors.append(ChargerPowerSensor(vue, charger))
-        if chargers:
-            _LOGGER.info("Monitoring %s chargers", len(chargers))
-        else:
-            _LOGGER.info("No chargers found for this account")
-    except Exception as err:
-        _LOGGER.warning("Unable to load charger status from Emporia: %s", err)
+        charger_sensors.append(
+            ChargerPowerSensor(coordinator, charger.device_gid)
+        )
 
-    async_add_entities(sensors, True)
+    if chargers:
+        _LOGGER.info("Monitoring %s chargers", len(chargers))
+    else:
+        _LOGGER.info("No chargers found for this account")
+
+    async_add_entities([*vehicle_sensors, *charger_sensors])
 
 
-class VehicleSensor(SensorEntity):
+class VehicleSensor(CoordinatorEntity[VehicleVueCoordinatorData], SensorEntity):
     """Representation of a Vehicle Battery Sensor."""
+
     _attr_device_class = SensorDeviceClass.BATTERY
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_suggested_display_precision = 0
     _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_should_poll = False
 
-    def __init__(self, vue_client: PyEmVue, vehicle: Vehicle):
-        # Creates a sensor for the vehicle.
-        self.vue = vue_client
+    def __init__(
+        self, coordinator: VehicleVueDataCoordinator, vehicle: Vehicle
+    ) -> None:
+        super().__init__(coordinator)
         self.vehicle = vehicle
+        self._attr_unique_id = f"sensor.vehiclevue.{self.vehicle.vehicle_gid}"
+        self._attr_name = self.vehicle.display_name
 
-    def update(self) -> None:
-        # Update battery level and additional attributes from Emporia API.
-        lastVehicleStatus = self.vue.get_vehicle_status(self.vehicle.vehicle_gid)
-        self.battery_level = lastVehicleStatus.battery_level
-        self.extra_attributes = lastVehicleStatus.as_dictionary()
-        _LOGGER.debug(
-            "Fetched vehicle status for vehicle %s - battery level %s",
-            self.vehicle,
-            lastVehicleStatus.battery_level,
-        )
+    def _latest_status(self):
+        if not self.coordinator.data:
+            return None
+        return self.coordinator.data.vehicle_status.get(self.vehicle.vehicle_gid)
 
     @property
     def native_value(self) -> str | None:
-        return self.battery_level
+        status = self._latest_status()
+        return status.battery_level if status else None
 
     @property
     def name(self) -> str:
@@ -109,12 +187,8 @@ class VehicleSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
-        return self.extra_attributes
-
-    @property
-    def unique_id(self):
-        """Unique ID for the vehicle"""
-        return f"sensor.vehiclevue.{self.vehicle.vehicle_gid}"
+        status = self._latest_status()
+        return status.as_dictionary() if status else {}
 
     @property
     def device_info(self):
@@ -128,17 +202,26 @@ class VehicleSensor(SensorEntity):
         }
 
 
-class ChargerStatusSensor(SensorEntity):
+class ChargerStatusSensor(
+    CoordinatorEntity[VehicleVueCoordinatorData], SensorEntity
+):
     """Text sensor describing Emporia EV charger status."""
 
     _attr_icon = "mdi:ev-station"
+    _attr_should_poll = False
 
-    def __init__(self, vue_client: PyEmVue, charger: ChargerDevice) -> None:
-        self.vue = vue_client
-        self.charger = charger
-        self._state = None
-        self.extra_attributes: dict[str, object] = {}
-        self._charger_name = self._get_charger_name(charger.device_gid)
+    def __init__(
+        self, coordinator: VehicleVueDataCoordinator, charger_gid: int
+    ) -> None:
+        super().__init__(coordinator)
+        self._charger_gid = charger_gid
+        self._charger_name = self._get_charger_name(charger_gid)
+        self._attr_unique_id = f"sensor.vehiclevue.charger.{charger_gid}"
+
+    def _charger(self) -> ChargerDevice | None:
+        if not self.coordinator.data:
+            return None
+        return self.coordinator.data.chargers.get(self._charger_gid)
 
     def _get_charger_name(self, charger_gid: int) -> str:
         device = charger_devices.get(charger_gid)
@@ -151,40 +234,12 @@ class ChargerStatusSensor(SensorEntity):
             )
         return f"Charger {charger_gid}"
 
-    def update(self) -> None:
-        # Fetch latest charger state from Emporia.
-        refreshed = _refresh_charger_state(self.vue, self.charger.device_gid)
-        if refreshed:
-            self.charger = refreshed
-        live_kw = _get_live_power_kw(self.vue, self.charger.device_gid)
-
-        self._state = self.charger.status or (
-            "on" if self.charger.charger_on else "off"
-        )
-        self.extra_attributes = {
-            "charger_on": self.charger.charger_on,
-            "message": self.charger.message,
-            "icon_label": self.charger.icon_label,
-            "icon_detail_text": self.charger.icon_detail_text,
-            "fault_text": self.charger.fault_text,
-            "charging_rate": self.charging_rate_display,
-            "max_charging_rate": self.charger.max_charging_rate,
-            "load_gid": self.charger.load_gid,
-            "pro_control_code": self.charger.pro_control_code,
-            "debug_code": self.charger.debug_code,
-            "live_power_kw": live_kw,
-        }
-        _LOGGER.debug(
-            "Fetched charger status for %s - state: %s rate: %s/%s",
-            self.charger.device_gid,
-            self._state,
-            self.charger.charging_rate,
-            self.charger.max_charging_rate,
-        )
-
     @property
     def native_value(self) -> str | None:
-        return self._state
+        charger = self._charger()
+        if not charger:
+            return None
+        return charger.status or ("on" if charger.charger_on else "off")
 
     @property
     def name(self) -> str:
@@ -192,18 +247,31 @@ class ChargerStatusSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
-        return self.extra_attributes
-
-    @property
-    def unique_id(self):
-        """Unique ID for the charger."""
-        return f"sensor.vehiclevue.charger.{self.charger.device_gid}"
+        charger = self._charger()
+        if not charger:
+            return {}
+        live_kw = None
+        if self.coordinator.data:
+            live_kw = self.coordinator.data.charger_power_kw.get(self._charger_gid)
+        return {
+            "charger_on": charger.charger_on,
+            "message": charger.message,
+            "icon_label": charger.icon_label,
+            "icon_detail_text": charger.icon_detail_text,
+            "fault_text": charger.fault_text,
+            "charging_rate": self.charging_rate_display,
+            "max_charging_rate": charger.max_charging_rate,
+            "load_gid": charger.load_gid,
+            "pro_control_code": charger.pro_control_code,
+            "debug_code": charger.debug_code,
+            "live_power_kw": live_kw,
+        }
 
     @property
     def device_info(self):
         """Return device information about this entity."""
         return {
-            "identifiers": {(DOMAIN, f"charger-{self.charger.device_gid}")},
+            "identifiers": {(DOMAIN, f"charger-{self._charger_gid}")},
             "name": self._charger_name,
         }
 
@@ -211,23 +279,28 @@ class ChargerStatusSensor(SensorEntity):
     def charging_rate_display(self) -> str | int:
         """Return a friendly charging rate value."""
         # charging_rate unit is reported directly from Emporia; keep raw.
-        return self.charger.charging_rate
+        charger = self._charger()
+        return charger.charging_rate if charger else "unknown"
 
 
-class ChargerPowerSensor(SensorEntity):
+class ChargerPowerSensor(
+    CoordinatorEntity[VehicleVueCoordinatorData], SensorEntity
+):
     """Power sensor for Emporia EV charger (current charging rate)."""
 
     _attr_device_class = SensorDeviceClass.POWER
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
     _attr_icon = "mdi:flash"
+    _attr_should_poll = False
 
-    def __init__(self, vue_client: PyEmVue, charger: ChargerDevice) -> None:
-        self.vue = vue_client
-        self.charger = charger
-        self._charger_name = self._get_charger_name(charger.device_gid)
-        self._native_value: float | None = None
-        self.extra_attributes: dict[str, object] = {}
+    def __init__(
+        self, coordinator: VehicleVueDataCoordinator, charger_gid: int
+    ) -> None:
+        super().__init__(coordinator)
+        self._charger_gid = charger_gid
+        self._charger_name = self._get_charger_name(charger_gid)
+        self._attr_unique_id = f"sensor.vehiclevue.charger.power.{charger_gid}"
 
     def _get_charger_name(self, charger_gid: int) -> str:
         device = charger_devices.get(charger_gid)
@@ -240,32 +313,22 @@ class ChargerPowerSensor(SensorEntity):
             )
         return f"Charger {charger_gid}"
 
-    def update(self) -> None:
-        refreshed = _refresh_charger_state(self.vue, self.charger.device_gid)
-        if refreshed:
-            self.charger = refreshed
-
-        live_kw = _get_live_power_kw(self.vue, self.charger.device_gid)
-        self._native_value = live_kw if live_kw is not None else self._calculate_kw(self.charger.charging_rate)
-        self.extra_attributes = {
-            "max_charging_rate": self.charger.max_charging_rate,
-            "charger_on": self.charger.charger_on,
-            "status": self.charger.status,
-            "raw_charging_rate_amps": self.charger.charging_rate,
-            "assumed_voltage": ASSUMED_VOLTAGE,
-            "live_power_kw": live_kw,
-        }
-        _LOGGER.debug(
-            "Fetched charger power for %s - rate: %s kW (raw %s/%s amps)",
-            self.charger.device_gid,
-            self._native_value,
-            self.charger.charging_rate,
-            self.charger.max_charging_rate,
-        )
+    def _charger(self) -> ChargerDevice | None:
+        if not self.coordinator.data:
+            return None
+        return self.coordinator.data.chargers.get(self._charger_gid)
 
     @property
     def native_value(self) -> float | None:
-        return self._native_value
+        charger = self._charger()
+        if not charger:
+            return None
+        live_kw = None
+        if self.coordinator.data:
+            live_kw = self.coordinator.data.charger_power_kw.get(self._charger_gid)
+        return live_kw if live_kw is not None else self._calculate_kw(
+            charger.charging_rate
+        )
 
     @property
     def name(self) -> str:
@@ -273,18 +336,26 @@ class ChargerPowerSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
-        return self.extra_attributes
-
-    @property
-    def unique_id(self):
-        """Unique ID for the charger power sensor."""
-        return f"sensor.vehiclevue.charger.power.{self.charger.device_gid}"
+        charger = self._charger()
+        if not charger:
+            return {}
+        live_kw = None
+        if self.coordinator.data:
+            live_kw = self.coordinator.data.charger_power_kw.get(self._charger_gid)
+        return {
+            "max_charging_rate": charger.max_charging_rate,
+            "charger_on": charger.charger_on,
+            "status": charger.status,
+            "raw_charging_rate_amps": charger.charging_rate,
+            "assumed_voltage": ASSUMED_VOLTAGE,
+            "live_power_kw": live_kw,
+        }
 
     @property
     def device_info(self):
         """Return device information about this entity."""
         return {
-            "identifiers": {(DOMAIN, f"charger-{self.charger.device_gid}")},
+            "identifiers": {(DOMAIN, f"charger-{self._charger_gid}")},
             "name": self._charger_name,
         }
 
@@ -293,26 +364,6 @@ class ChargerPowerSensor(SensorEntity):
             return None
         # Emporia charger reports amps; convert to kW assuming split-phase ~240V.
         return round((charging_rate * ASSUMED_VOLTAGE) / 1000, 3)
-
-
-def _refresh_charger_state(vue: PyEmVue, charger_gid: int) -> ChargerDevice | None:
-    """Refresh charger status with a short-lived cache to avoid double-polls per cycle."""
-    global _last_charger_poll, _last_charger_status
-    now = time.monotonic()
-    if _last_charger_poll and now - _last_charger_poll < 2:
-        if charger_gid in _last_charger_status:
-            return _last_charger_status[charger_gid]
-
-    devices = list(charger_devices.values()) if charger_devices else None
-    try:
-        (_, chargers) = vue.get_devices_status(devices)
-        _last_charger_poll = now
-        _last_charger_status = {c.device_gid: c for c in chargers}
-    except Exception as err:
-        _LOGGER.warning("Unable to refresh charger status: %s", err)
-        return None
-
-    return _last_charger_status.get(charger_gid)
 
 
 def _get_live_power_kw(vue: PyEmVue, charger_gid: int) -> float | None:
